@@ -18,7 +18,7 @@ Este repositorio aloja el código fuente y documentación técnica del proyecto 
 | :--- | :--- | :--- |
 | *Jose Antonio Fernandez Espindola* | 10655155 | Lider de grupo |
 | *Nataly Sami Romero Janco* | 10740437 | Lider de grupo |
-| *Aline Geraldy Vides Peñaloza * | 10213123 | Lider de grupo  |
+| *Aline Geraldy Vides Peñaloza * | 12595570 | Lider de grupo  |
 
 
 ---
