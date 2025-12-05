@@ -1,10 +1,14 @@
-nebulizador.ino
+Funciones.ino
 #include "funciones.h"
 
 void setup() {
-  setupSistema();
+  inicializarHardware();
+  mostrarPantallaInicial();
 }
 
 void loop() {
-  loopSistema();
+  leerBoton();
+  controlarFSM();
+  actualizarAlarma();
+  animacionWarning();   // SOLO LLAMO LA FUNCIÓN, no lógica acá
 }

@@ -1,34 +1,41 @@
 funciones.cpp
+
 #include "funciones.h"
 
-//variable global de estado
-EstadoSistema estadoActual = ESTADO_INICIO;
-
-//oled
+// ---------------- OBJETO OLED ----------------
 Adafruit_SSD1306 oled(OLED_ANCHO, OLED_ALTO, &Wire, OLED_RESET);
 
-//variables de debounce y temporizacion
+// ---------------- ESTADOS ----------------
+EstadoSistema estadoActual = ESTADO_INICIO;
+
+bool humidificadorActivo = false;
+bool bloqueoActivo = false;
+bool nebulizandoActivo = false;
+unsigned long ultimoTick = 0;
+
+// ---------------- BOTÓN ----------------
 static bool ultimoEstadoBoton = HIGH;
-static unsigned long ultimoCambioBoton = 0ULL;
-static unsigned long ultimoTick = 0ULL;
+static unsigned long ultimoCambio = 0;
 
-//variables de estado
-static bool HUMIFICADOR_ACTIVO = false;
-static bool NEBULIZANDO_ACTIVO = false;
-static bool BLOQUEADO_ALARMA = false;
-
-//alarma no bloqueante
+// ---------------- ALARMA ----------------
 static bool alarmaActiva = false;
 static int alarmaPaso = 0;
-static int alarmaContadorRep = 0;
-static unsigned long alarmaNextMillis = 0ULL;
+static int alarmaReps = 0;
+static unsigned long alarmaProx = 0;
 
-//setup del sistema
-void setupSistema() {
+// ---------------- ANIMACIÓN ----------------
+unsigned long animacionProxFrame = 0;
+int animacionPaso = 0;
+
+// ------------------------------------------------------
+// INICIALIZAR HARDWARE
+// ------------------------------------------------------
+void inicializarHardware() {
   Serial.begin(115200);
 
-  Wire.begin(21,22);
+  Wire.begin(21, 22);
   oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+
   oled.clearDisplay();
   oled.setTextColor(WHITE);
   oled.setTextSize(1);
@@ -43,72 +50,46 @@ void setupSistema() {
   digitalWrite(PIN_VENTILADOR, LOW);
   noTone(PIN_BUZZER);
 
-  mostrarPantallaInicial();
-
-  ultimoCambioBoton = 0;
   ultimoTick = millis();
 }
 
-//loop principal no bloqueante
-void loopSistema() {
-  unsigned long ahora = millis();
-
-  if (ahora - ultimoTick < PERIODO_LECTURA) {
-    alarmTick();
-    return;
-  }
-  ultimoTick = ahora;
-
+// ------------------------------------------------------
+// BOTÓN
+// ------------------------------------------------------
+void leerBoton() {
   if (botonPresionado()) {
-    if (BLOQUEADO_ALARMA) {
-      BLOQUEADO_ALARMA = false;
-      HUMIFICADOR_ACTIVO = false;
-      NEBULIZANDO_ACTIVO = false;
+
+    if (bloqueoActivo) {
+      bloqueoActivo = false;
+      humidificadorActivo = false;
+      nebulizandoActivo = false;
       estadoActual = ESTADO_INICIO;
       mostrarPantallaInicial();
+      return;
+    }
+
+    humidificadorActivo = !humidificadorActivo;
+
+    if (humidificadorActivo) {
+      estadoActual = ESTADO_NEBULIZANDO;
+      iniciarNebulizacion();
+      mostrarPantallaNebulizando();
     } else {
-      HUMIFICADOR_ACTIVO = !HUMIFICADOR_ACTIVO;
-      if (HUMIFICADOR_ACTIVO) {
-        estadoActual = ESTADO_NEBULIZANDO;
-        iniciarNebulizacion();
-        mostrarPantallaNebulizando();
-      } else {
-        detenerNebulizacion();
-        estadoActual = ESTADO_INICIO;
-        mostrarPantallaInicial();
-      }
-    }
-  }
-
-  if (!BLOQUEADO_ALARMA && HUMIFICADOR_ACTIVO && NEBULIZANDO_ACTIVO) {
-    if (sensorSinAgua()) {
-      activarAlarmaNoBloqueante();
-      BLOQUEADO_ALARMA = true;
-      HUMIFICADOR_ACTIVO = false;
-      NEBULIZANDO_ACTIVO = false;
       detenerNebulizacion();
-      estadoActual = ESTADO_BLOQUEADO;
-      mostrarPantallaSinAgua();
-    }
-  }
-
-  if (!HUMIFICADOR_ACTIVO && !NEBULIZANDO_ACTIVO && !BLOQUEADO_ALARMA) {
-    if (estadoActual != ESTADO_INICIO) {
       estadoActual = ESTADO_INICIO;
       mostrarPantallaInicial();
     }
   }
-
-  alarmTick();
 }
 
-//boton con debounce
 bool botonPresionado() {
-  bool lectura = digitalRead(PIN_BOTON);
   unsigned long ahora = millis();
+  bool lectura = digitalRead(PIN_BOTON);
 
-  if (lectura == LOW && ultimoEstadoBoton == HIGH && (ahora - ultimoCambioBoton) > TIEMPO_DEBOUNCE) {
-    ultimoCambioBoton = ahora;
+  if (lectura == LOW && ultimoEstadoBoton == HIGH &&
+      (ahora - ultimoCambio) > TIEMPO_DEBOUNCE) {
+
+    ultimoCambio = ahora;
     ultimoEstadoBoton = lectura;
     return true;
   }
@@ -117,39 +98,81 @@ bool botonPresionado() {
   return false;
 }
 
-//sensor de nivel
+// ------------------------------------------------------
+// SENSOR NIVEL
+// ------------------------------------------------------
 bool sensorSinAgua() {
-  int lectura = digitalRead(PIN_SENSOR_NIVEL);
-  return (lectura == LOW);
+  return digitalRead(PIN_SENSOR_NIVEL) == LOW;
 }
 
-//actuadores
+// ------------------------------------------------------
+// FSM
+// ------------------------------------------------------
+void controlarFSM() {
+  unsigned long ahora = millis();
+  if (ahora - ultimoTick < PERIODO_FSM) return;
+  ultimoTick = ahora;
+
+  if (estadoActual == ESTADO_NEBULIZANDO &&
+      humidificadorActivo && nebulizandoActivo) {
+
+    if (sensorSinAgua()) {
+      activarAlarma();
+      bloqueoActivo = true;
+      humidificadorActivo = false;
+      nebulizandoActivo = false;
+
+      detenerNebulizacion();
+      estadoActual = ESTADO_BLOQUEADO;
+
+      mostrarPantallaSinAgua();
+    }
+  }
+}
+
+// ------------------------------------------------------
+// ACTUADORES
+// ------------------------------------------------------
 void iniciarNebulizacion() {
   digitalWrite(PIN_HUMIDIFICADOR, HIGH);
   digitalWrite(PIN_VENTILADOR, HIGH);
-  NEBULIZANDO_ACTIVO = true;
+  nebulizandoActivo = true;
 }
 
 void detenerNebulizacion() {
   digitalWrite(PIN_HUMIDIFICADOR, LOW);
   digitalWrite(PIN_VENTILADOR, LOW);
   noTone(PIN_BUZZER);
-  NEBULIZANDO_ACTIVO = false;
+  nebulizandoActivo = false;
 }
 
-//pantallas
+// ------------------------------------------------------
+// PANTALLAS
+// ------------------------------------------------------
 void mostrarPantallaInicial() {
   oled.clearDisplay();
-  oled.setCursor(0,0);
-  oled.println("Presione el boton");
-  oled.println("para iniciar la");
-  oled.println("nebulizacion");
+
+  oled.setTextSize(2);
+  oled.setCursor(5, 6);
+  oled.print("BIENVENIDO");
+
+  oled.setTextSize(1);
+  oled.setCursor(10, 24);
+  oled.print("Listo para iniciar");
+
+  oled.setCursor(26, 33);
+  oled.print("nebulizacion");
+
+  oled.drawRect(2, 45, 121, 16, 1);
+  oled.setCursor(12, 49);
+  oled.print("PRESIONE EL BOTON");
+
   oled.display();
 }
 
 void mostrarPantallaNebulizando() {
   oled.clearDisplay();
-  oled.setCursor(0,0);
+  oled.setCursor(2, 2);
   oled.println("Nebulizando...");
   oled.println("Proceso activo");
   oled.display();
@@ -157,7 +180,7 @@ void mostrarPantallaNebulizando() {
 
 void mostrarPantallaSinAgua() {
   oled.clearDisplay();
-  oled.setCursor(0,0);
+  oled.setCursor(0, 0);
   oled.println("SIN AGUA!");
   oled.println("Recargar deposito");
   oled.println("y presionar boton");
@@ -166,49 +189,94 @@ void mostrarPantallaSinAgua() {
 
 void mostrarPantallaBloqueado() {
   oled.clearDisplay();
-  oled.setCursor(0,0);
+  oled.setCursor(0, 0);
   oled.println("Sistema Bloqueado");
   oled.println("Presione boton");
   oled.display();
 }
 
-//alarma no bloqueante
-void activarAlarmaNoBloqueante() {
-  alarmaActiva = true;
-  alarmaPaso = 0;
-  alarmaContadorRep = 0;
-  alarmaNextMillis = millis();
+// ------------------------------------------------------
+// ANIMACIÓN – SIN BORRAR EL TEXTO
+// ------------------------------------------------------
+void animacionWarning() {
+  if (estadoActual != ESTADO_BLOQUEADO) return;
+
+  unsigned long ahora = millis();
+  if (ahora < animacionProxFrame) return;
+
+  // SOLO BORRA LA ZONA INFERIOR, NO EL TEXTO
+  oled.fillRect(0, 32, 128, 32, BLACK);
+
+  switch (animacionPaso) {
+    case 0:
+      oled.fillTriangle(64, 40, 44, 70, 84, 70, WHITE);
+      break;
+
+    case 1:
+      oled.fillTriangle(64, 38, 45, 72, 83, 72, WHITE);
+      break;
+
+    case 2:
+      oled.fillTriangle(64, 42, 42, 68, 86, 68, WHITE);
+      break;
+  }
+
+  // Signo !
+  oled.fillRect(62, 50, 4, 10, BLACK);
+  oled.fillRect(62, 63, 4, 4, BLACK);
+
+  oled.display();
+
+  animacionPaso++;
+  if (animacionPaso > 2) animacionPaso = 0;
+  animacionProxFrame = ahora + 200;
 }
 
-void alarmTick() {
+// ------------------------------------------------------
+// ALARMA
+// ------------------------------------------------------
+void activarAlarma() {
+  alarmaActiva = true;
+  alarmaPaso = 0;
+  alarmaReps = 0;
+  alarmaProx = millis();
+}
+
+void actualizarAlarma() {
   if (!alarmaActiva) return;
 
   unsigned long ahora = millis();
-  if (ahora < alarmaNextMillis) return;
+  if (ahora < alarmaProx) return;
 
-  if (alarmaPaso == 0) {
-    tone(PIN_BUZZER,3000);
-    alarmaNextMillis = ahora + 350UL;
-    alarmaPaso = 1;
-  } else if (alarmaPaso == 1) {
-    noTone(PIN_BUZZER);
-    alarmaNextMillis = ahora + 100UL;
-    alarmaPaso = 2;
-  } else if (alarmaPaso == 2) {
-    tone(PIN_BUZZER,1800);
-    alarmaNextMillis = ahora + 250UL;
-    alarmaPaso = 3;
-  } else if (alarmaPaso == 3) {
-    noTone(PIN_BUZZER);
-    alarmaContadorRep++;
-    if (alarmaContadorRep >= ALARMA_REPETICIONES) {
-      alarmaActiva = false;
-      alarmaPaso = 0;
-      alarmaContadorRep = 0;
+  switch (alarmaPaso) {
+    case 0:
+      tone(PIN_BUZZER, 3000);
+      alarmaProx = ahora + 350;
+      alarmaPaso = 1;
+      break;
+
+    case 1:
       noTone(PIN_BUZZER);
-    } else {
-      alarmaNextMillis = ahora + 300UL;
-      alarmaPaso = 0;
-    }
+      alarmaProx = ahora + 100;
+      alarmaPaso = 2;
+      break;
+
+    case 2:
+      tone(PIN_BUZZER, 1800);
+      alarmaProx = ahora + 250;
+      alarmaPaso = 3;
+      break;
+
+    case 3:
+      noTone(PIN_BUZZER);
+      alarmaReps++;
+
+      if (alarmaReps >= ALARMA_REPETICIONES) {
+        alarmaActiva = false;
+      } else {
+        alarmaProx = ahora + 300;
+        alarmaPaso = 0;
+      }
+      break;
   }
 }
