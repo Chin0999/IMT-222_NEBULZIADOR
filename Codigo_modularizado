@@ -1,1 +1,15 @@
+Funciones.ino
 
+#include "funciones.h"
+
+void setup() {
+  inicializarHardware();
+  mostrarPantallaInicial();
+}
+
+void loop() {
+  leerBoton();
+  controlarFSM();
+  actualizarAlarma();
+  animacionWarning();   // SOLO LLAMO LA FUNCIÓN, no lógica acá
+}
