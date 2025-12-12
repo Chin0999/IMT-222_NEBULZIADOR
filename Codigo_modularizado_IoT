@@ -1,0 +1,431 @@
+codigo.ino
+
+#include "funciones.h"
+
+// -------------------------
+// BLYNK
+// -------------------------
+#define BLYNK_TEMPLATE_ID "TMPL2OnHsJXNC"
+#define BLYNK_TEMPLATE_NAME "Nebulizador"
+#define BLYNK_AUTH_TOKEN "jVPZlWFU955gJl08RoqVdf0mOcJEdL4w"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// Tu WiFi
+char ssid[] = "Central";
+char pass[] = "f3**w12ex*p8d4mg*uimt+bgc";
+
+// Variables compartidas y externas
+extern bool humidificadorActivo;
+extern bool nebulizandoActivo;
+
+// -------------------------
+// Control por Blynk
+// -------------------------
+
+// Botón virtual V0 → Prende/Apaga HUMIDIFICADOR
+BLYNK_WRITE(V0) {
+  int estado = param.asInt();  // 1 ON, 0 OFF
+
+  if (estado == 1) {
+    humidificadorActivo = true;
+    estadoActual = ESTADO_NEBULIZANDO;
+    iniciarNebulizacion();
+    mostrarPantallaNebulizando();
+    Blynk.virtualWrite(V2, "Nebulizando...");
+  } else {
+    humidificadorActivo = false;
+    detenerNebulizacion();
+    estadoActual = ESTADO_INICIO;
+    mostrarPantallaInicial();
+    Blynk.virtualWrite(V2, "Apagado");
+  }
+}
+
+// Botón virtual V1 → Prende/Apaga VENTILADOR SOLO
+BLYNK_WRITE(V1) {
+  int estado = param.asInt();
+
+  if (estado == 1) {
+    digitalWrite(PIN_VENTILADOR, HIGH);
+  } else {
+    digitalWrite(PIN_VENTILADOR, LOW);
+  }
+}
+
+void setup() {
+  inicializarHardware();
+  mostrarPantallaInicial();
+
+  // Inicia Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+}
+
+void loop() {
+  Blynk.run();
+
+  // Watchdog de pantalla OLED
+  if (!oledOK()) reiniciarOLED();
+
+  leerBoton();
+  controlarFSM();
+  actualizarAlarma();
+  animacionWarning();
+}
+
+
+
+funciones.cpp
+
+#include "funciones.h"
+
+//OBJETO OLED
+Adafruit_SSD1306 oled(OLED_ANCHO, OLED_ALTO, &Wire, OLED_RESET);
+
+// ESTADOS
+EstadoSistema estadoActual = ESTADO_INICIO;
+
+bool humidificadorActivo = false;
+bool bloqueoActivo = false;
+bool nebulizandoActivo = false;
+unsigned long ultimoTick = 0;
+
+// BOTÓN
+static bool ultimoEstadoBoton = HIGH;
+static unsigned long ultimoCambio = 0;
+
+// ALARMA 
+static bool alarmaActiva = false;
+static int alarmaPaso = 0;
+static int alarmaReps = 0;
+static unsigned long alarmaProx = 0;
+
+// ANIMACIÓN 
+unsigned long animacionProxFrame = 0;
+int animacionPaso = 0;
+
+
+// REINICIO OLED
+void reiniciarOLED() {
+  oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  oled.clearDisplay();
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1);
+}
+
+bool oledOK() {
+  return oled.getBuffer() != nullptr;
+}
+
+
+// INICIALIZAR HARDWARE
+void inicializarHardware() {
+  Serial.begin(115200);
+  Wire.begin(21, 22, 400000);
+
+  oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+
+  oled.clearDisplay();
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1);
+
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  pinMode(PIN_HUMIDIFICADOR, OUTPUT);
+  pinMode(PIN_VENTILADOR, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_SENSOR_NIVEL, INPUT);
+
+  digitalWrite(PIN_HUMIDIFICADOR, LOW);
+  digitalWrite(PIN_VENTILADOR, LOW);
+  noTone(PIN_BUZZER);
+
+  ultimoTick = millis();
+}
+
+
+// BOTÓN
+void leerBoton() {
+  if (botonPresionado()) {
+
+    if (bloqueoActivo) {
+      bloqueoActivo = false;
+      humidificadorActivo = false;
+      nebulizandoActivo = false;
+      estadoActual = ESTADO_INICIO;
+      mostrarPantallaInicial();
+      return;
+    }
+
+    humidificadorActivo = !humidificadorActivo;
+
+    if (humidificadorActivo) {
+      estadoActual = ESTADO_NEBULIZANDO;
+      iniciarNebulizacion();
+      mostrarPantallaNebulizando();
+    } else {
+      detenerNebulizacion();
+      estadoActual = ESTADO_INICIO;
+      mostrarPantallaInicial();
+    }
+  }
+}
+
+bool botonPresionado() {
+  unsigned long ahora = millis();
+  bool lectura = digitalRead(PIN_BOTON);
+
+  if (lectura == LOW && ultimoEstadoBoton == HIGH &&
+      (ahora - ultimoCambio) > TIEMPO_DEBOUNCE) {
+
+    ultimoCambio = ahora;
+    ultimoEstadoBoton = lectura;
+    return true;
+  }
+
+  ultimoEstadoBoton = lectura;
+  return false;
+}
+
+
+// SENSOR
+bool sensorSinAgua() {
+  return digitalRead(PIN_SENSOR_NIVEL) == LOW;
+}
+
+
+// FSM
+void controlarFSM() {
+  unsigned long ahora = millis();
+  if (ahora - ultimoTick < PERIODO_FSM) return;
+  ultimoTick = ahora;
+
+  if (estadoActual == ESTADO_NEBULIZANDO &&
+      humidificadorActivo && nebulizandoActivo) {
+
+    if (sensorSinAgua()) {
+      activarAlarma();
+      bloqueoActivo = true;
+      humidificadorActivo = false;
+      nebulizandoActivo = false;
+
+      detenerNebulizacion();
+      estadoActual = ESTADO_BLOQUEADO;
+
+      mostrarPantallaSinAgua();
+    }
+  }
+}
+
+
+// ACTUADORES
+void iniciarNebulizacion() {
+  digitalWrite(PIN_HUMIDIFICADOR, HIGH);
+  digitalWrite(PIN_VENTILADOR, HIGH);
+  nebulizandoActivo = true;
+}
+
+void detenerNebulizacion() {
+  digitalWrite(PIN_HUMIDIFICADOR, LOW);
+  digitalWrite(PIN_VENTILADOR, LOW);
+  noTone(PIN_BUZZER);
+  nebulizandoActivo = false;
+}
+
+
+// PANTALLAS
+void mostrarPantallaInicial() {
+  oled.clearDisplay();
+
+  oled.setTextSize(2);
+  oled.setCursor(5, 6);
+  oled.print("BIENVENIDO");
+
+  oled.setTextSize(1);
+  oled.setCursor(10, 24);
+  oled.print("Listo para iniciar");
+
+  oled.setCursor(26, 33);
+  oled.print("nebulizacion");
+
+  oled.drawRect(2, 45, 121, 16, 1);
+  oled.setCursor(12, 49);
+  oled.print("PRESIONE EL BOTON");
+
+  oled.display();
+}
+
+void mostrarPantallaNebulizando() {
+  oled.clearDisplay();
+  oled.setCursor(2, 2);
+  oled.println("Nebulizando...");
+  oled.println("Proceso activo");
+  oled.display();
+}
+
+void mostrarPantallaSinAgua() {
+  oled.clearDisplay();
+  oled.setCursor(0, 0);
+  oled.println("SIN AGUA!");
+  oled.println("Recargar deposito");
+  oled.println("y presionar boton");
+  oled.display();
+}
+
+void mostrarPantallaBloqueado() {
+  oled.clearDisplay();
+  oled.setCursor(0, 0);
+  oled.println("Sistema Bloqueado");
+  oled.println("Presione boton");
+  oled.display();
+}
+
+
+// ANIMACIÓN
+void animacionWarning() {
+  if (estadoActual != ESTADO_BLOQUEADO) return;
+
+  unsigned long ahora = millis();
+  if (ahora < animacionProxFrame) return;
+
+  oled.fillRect(0, 32, 128, 32, BLACK);
+
+  const uint16_t y1[3] = {40, 38, 42};
+  const uint16_t x2[3] = {44, 45, 42};
+  const uint16_t x3[3] = {84, 83, 86};
+  const uint16_t y2[3] = {70, 72, 68};
+
+  oled.fillTriangle(
+    64, y1[animacionPaso],
+    x2[animacionPaso], y2[animacionPaso],
+    x3[animacionPaso], y2[animacionPaso],
+    WHITE
+  );
+
+  oled.fillRect(62, 50, 4, 10, BLACK);
+  oled.fillRect(62, 63, 4, 4, BLACK);
+
+  oled.display();
+
+  animacionPaso++;
+  if (animacionPaso > 2) animacionPaso = 0;
+  animacionProxFrame = ahora + 200;
+}
+
+
+// ALARMA
+void activarAlarma() {
+  alarmaActiva = true;
+  alarmaPaso = 0;
+  alarmaReps = 0;
+  alarmaProx = millis();
+}
+
+void actualizarAlarma() {
+  if (!alarmaActiva) return;
+
+  unsigned long ahora = millis();
+  if (ahora < alarmaProx) return;
+
+  switch (alarmaPaso) {
+    case 0:
+      tone(PIN_BUZZER, 3000);
+      alarmaProx = ahora + 350;
+      alarmaPaso = 1;
+      break;
+
+    case 1:
+      noTone(PIN_BUZZER);
+      alarmaProx = ahora + 100;
+      alarmaPaso = 2;
+      break;
+
+    case 2:
+      tone(PIN_BUZZER, 1800);
+      alarmaProx = ahora + 250;
+      alarmaPaso = 3;
+      break;
+
+    case 3:
+      noTone(PIN_BUZZER);
+      alarmaReps++;
+
+      if (alarmaReps >= ALARMA_REPETICIONES) {
+        alarmaActiva = false;
+      } else {
+        alarmaProx = ahora + 300;
+        alarmaPaso = 0;
+      }
+      break;
+  }
+}
+
+
+funciones.H
+
+#ifndef FUNCIONES_H
+#define FUNCIONES_H
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED
+#define OLED_ANCHO 128
+#define OLED_ALTO 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+
+// Pines
+#define PIN_BOTON           18
+#define PIN_HUMIDIFICADOR   23
+#define PIN_VENTILADOR      19
+#define PIN_BUZZER          15
+#define PIN_SENSOR_NIVEL    32
+
+// Tiempos
+#define TIEMPO_DEBOUNCE 300UL
+#define PERIODO_FSM     50UL
+#define ALARMA_REPETICIONES 5
+
+// Estados
+enum EstadoSistema {
+  ESTADO_INICIO,
+  ESTADO_NEBULIZANDO,
+  ESTADO_BLOQUEADO
+};
+
+extern EstadoSistema estadoActual;
+extern Adafruit_SSD1306 oled;
+
+extern bool humidificadorActivo;
+extern bool bloqueoActivo;
+extern bool nebulizandoActivo;
+
+extern unsigned long ultimoTick;
+
+// Prototipos
+void inicializarHardware();
+void leerBoton();
+bool botonPresionado();
+bool sensorSinAgua();
+
+void controlarFSM();
+void iniciarNebulizacion();
+void detenerNebulizacion();
+
+void mostrarPantallaInicial();
+void mostrarPantallaNebulizando();
+void mostrarPantallaSinAgua();
+void mostrarPantallaBloqueado();
+
+void animacionWarning();
+
+void reiniciarOLED();
+bool oledOK();
+
+void activarAlarma();
+void actualizarAlarma();
+
+#endif
